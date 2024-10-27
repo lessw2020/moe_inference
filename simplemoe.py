@@ -79,6 +79,17 @@ class ExpertUsageTracker:
             "total_samples": self.total_samples,
         }
 
+def cleanup():
+    dist.destroy_process_group()
+    
+    # Clean up logging handlers if we're rank 0
+    try:
+        logger = logging.getLogger('MoE_Training')
+        for handler in logger.handlers[:]:
+            handler.close()
+            logger.removeHandler(handler)
+    except:
+        pass
 
 class DistributedMoE(nn.Module):
     def __init__(self, num_experts, input_size, hidden_size, output_size, world_size):
