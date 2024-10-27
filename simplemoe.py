@@ -53,15 +53,35 @@ class ExpertUsageTracker:
         self.expert_counts = defaultdict(int)
         self.total_samples = 0
         self.routing_distribution = torch.zeros(self.num_experts)
+        self.token_expert_history = []  # Track token assignments per iteration
+        self.capacity_factor = torch.zeros(self.num_experts)  # Track expert load
 
-    def update(self, expert_indices, routing_probs):
+    def update(self, expert_indices, routing_probs, batch_idx):
+        # Track which tokens went to which experts
+        expert_assignment = defaultdict(list)
+        for token_idx, expert_idx in enumerate(expert_indices.cpu().numpy()):
+            expert_assignment[int(expert_idx)].append(token_idx)
+
+        # Calculate capacity utilization
         unique_experts, counts = torch.unique(expert_indices, return_counts=True)
+        batch_size = len(expert_indices)
+        capacity = defaultdict(float)
         for expert, count in zip(unique_experts.cpu().numpy(), counts.cpu().numpy()):
+            capacity[expert] = (count / batch_size) * 100
             self.expert_counts[expert] += count
+            self.capacity_factor[expert] += count
+
+        # Store this iteration's routing pattern
+        self.token_expert_history.append(
+            {
+                "batch_idx": batch_idx,
+                "expert_assignments": dict(expert_assignment),
+                "expert_capacity": dict(capacity),
+            }
+        )
+
         self.total_samples += len(expert_indices)
-        self.routing_distribution += (
-            routing_probs.sum(0).detach().cpu()
-        )  # Added detach()
+        self.routing_distribution += routing_probs.sum(0).detach().cpu()
 
     def get_stats(self):
         usage_percentages = {
@@ -72,24 +92,32 @@ class ExpertUsageTracker:
             (self.routing_distribution / self.routing_distribution.sum())
             .detach()
             .numpy()
-        )  # Added detach()
+        )
+
+        # Calculate average capacity factor per expert
+        avg_capacity = (self.capacity_factor / len(self.token_expert_history)).tolist()
+
         return {
             "expert_usage_percentages": usage_percentages,
             "routing_distribution": routing_dist,
             "total_samples": self.total_samples,
+            "token_routing_history": self.token_expert_history,
+            "average_capacity_factor": avg_capacity,
         }
+
 
 def cleanup():
     dist.destroy_process_group()
-    
+
     # Clean up logging handlers if we're rank 0
     try:
-        logger = logging.getLogger('MoE_Training')
+        logger = logging.getLogger("MoE_Training")
         for handler in logger.handlers[:]:
             handler.close()
             logger.removeHandler(handler)
     except:
         pass
+
 
 class DistributedMoE(nn.Module):
     def __init__(self, num_experts, input_size, hidden_size, output_size, world_size):
@@ -117,8 +145,11 @@ class DistributedMoE(nn.Module):
         self.logger = (
             logging.getLogger("MoE_Training") if dist.get_rank() == 0 else None
         )
+        self.current_batch = 0
 
-    def _compute_load_balancing_loss(self, router_probs):
+    def _compute_load_balancing_loss(
+        self, router_probs
+    ):  # Method is defined with underscore
         expert_loads = router_probs.mean(dim=0)
         target_loads = torch.ones_like(expert_loads) / self.num_experts
         aux_loss = torch.mean(torch.sum(expert_loads * expert_loads)) * self.num_experts
@@ -138,7 +169,8 @@ class DistributedMoE(nn.Module):
         expert_indices = torch.argmax(routing_probs, dim=-1)
 
         if self.logger:
-            self.usage_tracker.update(expert_indices, routing_probs)
+            self.usage_tracker.update(expert_indices, routing_probs, self.current_batch)
+            self.current_batch += 1  # Increment batch counter
             router_time = time.time() - start_time
             self.logger.debug(f"Router processing time: {router_time:.4f}s")
 
@@ -246,17 +278,16 @@ def run_training(rank, world_size):
     model = DDP(model, device_ids=[rank])
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    # Training metrics
     best_loss = float("inf")
     running_loss = 0.0
 
     for epoch in range(10):
         epoch_start = time.time()
         if logger:
-            logger.info(f"Starting epoch {epoch}")
+            logger.info(f"\nStarting epoch {epoch}")
             model.module.usage_tracker.reset_stats()
 
-        for batch_idx in range(10):  # Added multiple batches per epoch
+        for batch_idx in range(10):
             inputs = torch.randn(32, 256, device=rank)
             targets = torch.randn(32, 256, device=rank)
 
@@ -274,31 +305,54 @@ def run_training(rank, world_size):
 
             running_loss += loss.item()
 
-            if logger and batch_idx % 5 == 0:
+            if logger and batch_idx % 2 == 0:  # Increased logging frequency
                 batch_time = time.time() - batch_start
-                logger.info(f"Epoch {epoch}, Batch {batch_idx}")
+                logger.info(f"\nEpoch {epoch}, Batch {batch_idx}")
                 logger.info(
                     f"Main Loss: {main_loss.item():.4f}, Aux Loss: {aux_loss.item():.4f}"
                 )
                 logger.info(f"Batch processing time: {batch_time:.4f}s")
 
+                # Log token-expert routing for this batch
+                stats = model.module.usage_tracker.get_stats()
+                current_batch = stats["token_routing_history"][-1]
+
+                logger.info("\nToken-Expert Routing Summary for current batch:")
+                logger.info("Expert | Token Count | Tokens | Capacity")
+                logger.info("-" * 50)
+                for expert in range(model.module.num_experts):
+                    tokens = current_batch["expert_assignments"].get(expert, [])
+                    capacity = current_batch["expert_capacity"].get(expert, 0)
+                    logger.info(
+                        f"E{expert:2d}   | {len(tokens):11d} | {tokens[:5]}{'...' if len(tokens)>5 else ''} | {capacity:.1f}%"
+                    )
+
+                # Show load balancing metrics
+                logger.info("\nLoad Balancing Metrics:")
+                for expert in range(model.module.num_experts):
+                    avg_capacity = stats["average_capacity_factor"][expert]
+                    logger.info(f"Expert {expert}: Avg Capacity: {avg_capacity:.1f}%")
+
         if logger:
             epoch_time = time.time() - epoch_start
             avg_loss = running_loss / (batch_idx + 1)
-            logger.info(f"Epoch {epoch} completed in {epoch_time:.2f}s")
-            logger.info(f"Average loss: {avg_loss:.4f}")
+            logger.info(f"\nEpoch {epoch} Summary:")
+            logger.info(f"Time: {epoch_time:.2f}s, Average loss: {avg_loss:.4f}")
 
-            # Log expert usage statistics
+            # Log overall epoch expert usage statistics
             stats = model.module.usage_tracker.get_stats()
-            logger.info("Expert Usage Statistics:")
-            for expert, usage in stats["expert_usage_percentages"].items():
-                logger.info(f"Expert {expert}: {usage:.2f}%")
-            logger.info(f"Routing distribution: {stats['routing_distribution']}")
+            logger.info("\nEpoch Expert Usage Statistics:")
+            logger.info("Expert | Usage % | Routing Weight")
+            logger.info("-" * 40)
+            for expert in range(model.module.num_experts):
+                usage = stats["expert_usage_percentages"].get(expert, 0)
+                routing_weight = stats["routing_distribution"][expert]
+                logger.info(f"E{expert:2d}   | {usage:6.2f}% | {routing_weight:.4f}")
 
             running_loss = 0.0
 
     if logger:
-        logger.info("Training completed")
+        logger.info("\nTraining completed")
 
     cleanup()
 
